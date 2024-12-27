@@ -1,0 +1,357 @@
+#lang shplait
+import:
+  open:
+    "class.rhm"
+    "inherit.rhm"
+
+// ----------------------------------------
+
+fun parse_class(s :: Syntax) :: (Symbol * ClassI):
+  match s
+  | 'class $name($field, ...):
+       extends $parent_name
+       $method
+       ...':
+      values(syntax_to_symbol(name),
+             classI(syntax_to_symbol(parent_name),
+                    map(parse_field,
+                        syntax_to_list('[$field, ...]')),
+                    map(parse_method,
+                        syntax_to_list('[$method, ...]'))))
+  | ~else: error(#'parse_class, "invalid input: " +& s)
+
+fun parse_field(s :: Syntax) :: Symbol:
+  cond
+  | syntax_is_symbol(s):
+      syntax_to_symbol(s)
+  | ~else: error(#'parse_field, "invalid input: " +& s)
+
+fun parse_method(s :: Syntax) :: (Symbol * ExpI):
+  match s
+  |'private method $name(arg): $body':
+     values(syntax_to_symbol(name),
+            parse(body))
+  |'method $name(arg): $body':
+     values(syntax_to_symbol(name),
+            parse(body))
+  | 'method $name(null) : $body':
+      values(syntax_to_symbol(name),
+             parse(body))         
+  | ~else: error(#'parse_method, "invalid input: " +& s)
+
+fun parse(s :: Syntax) :: ExpI:
+  cond
+  | syntax_is_integer(s):
+      intI(syntax_to_integer(s))
+  | ~else:
+      match s
+      | 'if $arg == 0 | $true | $false':
+          if0I(parse(arg), parse(true), parse(false))
+      | 'arg': argI()
+      | 'this': thisI()
+      | 'null': nullI()
+      | '$left + $right':
+          plusI(parse(left),
+                parse(right))
+      | '$left * $right':
+          multI(parse(left),
+                parse(right))
+      | 'new $id($arg, ...)':
+          newI(syntax_to_symbol(id),
+               map(parse, syntax_to_list('[$arg, ...]')))
+      | 'super . $method_name ($arg)':
+          superI(privateI(), syntax_to_symbol(method_name),
+                 parse(arg))
+      | '$obj . $method_name ($arg)':
+          def obj_i = parse(obj)
+          if obj_i == thisI()
+          | sendI(privateI(),
+                  obj_i,
+                  syntax_to_symbol(method_name),
+                  parse(arg))
+          | sendI(publicI(),
+                  obj_i,
+                  syntax_to_symbol(method_name),
+                  parse(arg))
+      | '$obj . $field_name':
+          getI(parse(obj),
+               syntax_to_symbol(field_name))
+      | '($e)':
+          parse(e)
+      | ~else:
+          error(#'parse, "invalid input: " +& s)
+
+module test:
+  check: parse('if 1 == 0 | 1 | 0')
+         ~is if0I(intI(1), intI(1), intI(0))
+  // null tests
+  check: parse('null')
+         ~is nullI()
+  check: parse('null.x')
+         ~is getI(nullI(), #'x)
+  // old tests
+  check: parse('0')
+         ~is intI(0)
+  check: parse('arg')
+         ~is argI()
+  check: parse('this')
+         ~is thisI()
+  check: parse('1 + 2')
+         ~is plusI(intI(1), intI(2))
+  check: parse('1 * 2')
+         ~is multI(intI(1), intI(2))
+  check: parse('new Posn(1, 2)')
+         ~is newI(#'Posn, [intI(1), intI(2)])
+  check: parse('this.x')
+         ~is getI(thisI(), #'x)
+  check: parse('this.m(2)')
+         ~is sendI(privateI(), thisI(), #'m, intI(2))
+  check: parse('super.m(1)')
+         ~is superI(privateI(), #'m, intI(1))
+  check: parse('x')
+         ~raises "invalid input"
+  // null tests
+  check: parse_field('null')
+         ~is #'null
+  // old tests
+  check: parse_field('x')
+         ~is #'x
+  check: parse_field('x 1')
+         ~raises "invalid input"
+
+  check: parse_method('method m(null): null')
+         ~is values(#'m, nullI())
+  check: parse_method('method m(null): this')
+         ~is values(#'m, thisI())
+  check: parse_method('method m(arg): this')
+         ~is values(#'m, thisI())
+  check: parse_method('m(arg): 1 2')
+         ~raises "invalid input"
+  
+  check: parse_class('class Posn3D(x, y, z):
+                        extends Posn 
+                        method m1(arg): arg
+                        method m2(arg): this')
+         ~is values(#'Posn3D,
+                    classI(#'Posn,
+                           [#'x, #'y, #'z],
+                           [values(#'m1, argI()),
+                            values(#'m2, thisI())]))
+  check: parse_class('class')
+         ~raises "invalid input"
+
+// ----------------------------------------
+
+// Interpret a Moe program with inheritance that is
+// written with concrete syntax
+fun interp_prog(classes :: Listof(Syntax), s :: Syntax) :: Syntax:
+  let v = interp_i(parse(s),
+                   map(parse_class, classes)):
+    match v
+    | intV(n): integer_to_syntax(n)
+    | objV(class_name, field_vals): symbol_to_syntax(class_name)
+    | nullV(): 'null'
+    | ~else: 'should not be returned'
+
+module test:
+  // if0I tests
+  check: interp_prog(
+           ['class Posn(x, y):
+               extends Object
+               method mdist(arg):
+                 if arg == 0 | 1 | 2
+               method addDist(arg): arg.mdist(0) + this.mdist(0)'],
+           '(new Posn(5, 3)).mdist(0)'
+         )
+         ~is '1'
+  check: interp_prog(
+           ['class Posn(x, y):
+               extends Object
+               method mdist(arg):
+                 if arg == 0 | 1 | 2
+               method addDist(arg): arg.mdist(0) + this.mdist(0)'],
+           '(new Posn(5, 3)).mdist(1)'
+         )
+         ~is '2'
+  check: interp_prog(
+           ['class Posn(x, y):
+               extends Object
+               method mdist(arg):
+                 if 1 == 0 | 1 | 2
+               method addDist(arg): arg.mdist(0) + this.mdist(0)'],
+           '(new Posn(5, 3)).mdist(1)'
+         )
+         ~is '2'
+  check: interp_prog(
+           ['class Posn(x, y):
+               extends Object
+               method mdist(arg):
+                 if 0 == 0 | 1 | 2
+               method addDist(arg): arg.mdist(0) + this.mdist(0)'],
+           '(new Posn(5, 3)).mdist(1)'
+         )
+         ~is '1'
+  check: interp_prog(
+           ['class Animal(x):
+               extends Object
+               method mdist(arg):
+                 this.x',
+            'class Dog(y):
+               extends Animal
+               method a(arg):
+                 if 0 == 0 | new Dog(2, 1) | new Animal(2)'],
+           '(new Dog(1, 5)).a(1)'
+         )
+         ~is 'Dog'
+  check: interp_prog(
+           ['class Animal(x):
+               extends Object
+               method mdist(arg):
+                 this.x',
+            'class Dog(y):
+               extends Animal
+               method a(arg):
+                 if arg == 0 | new Dog(2, 1) | new Animal(2)'],
+           '(new Dog(1, 5)).a(1)'
+         )
+         ~is 'Animal'
+  check: interp_prog(
+           ['class Animal(x):
+               extends Object
+               method mdist(arg):
+                 this.x',
+            'class Dog(y):
+               extends Animal
+               method a(arg):
+                 if arg == 0 | new Dog(1, 2) | new Animal(2)'],
+           '(new Dog(5, 2)).a(0)'
+         )
+         ~is 'Dog'
+  // private tests
+  check: interp_prog(
+           ['class Posn(x, y):
+               extends Object
+               private method mdist(arg): this.x + this.y
+               method addDist(arg): arg.mdist(0) + this.mdist(0)',
+            'class Posn3D(z):
+               extends Posn
+               method mdist(arg): this.z + super.mdist(arg)'],
+           '(new Posn3D(5, 3, 1)).addDist(new Posn(2, 7))'
+         )
+         ~is '18'
+  // null tests
+
+  check: interp_prog(
+           ['class Posn(x, y):
+               extends Object
+               method mdist(arg): this.x + this.y
+               method addDist(arg): 1'],
+           '(new Posn(5, 1)).addDist(null)'
+         )
+         ~is '1'
+  check: interp_prog(
+           ['class Posn(x, y):
+               extends Object
+               method mdist(arg): this.x + this.y
+               method addDist(arg): arg.mdist(0) + this.mdist(0)',
+            'class Posn3D(z):
+               extends Posn
+               method mdist(arg): this.z + super.mdist(arg)'],
+           'null'
+         )
+         ~is 'null'
+  check: interp_prog(
+           ['class Posn(x, y):
+               extends Object
+               method mdist(arg): this.x + this.y
+               method addDist(arg): arg.mdist(0) + this.mdist(0)',
+            'class Posn3D(z):
+               extends Posn
+               method mdist(arg): this.z + super.mdist(arg)'],
+           '(new Posn3D(5, null, 1))'
+         )
+         ~is 'Posn3D'
+  check: interp_prog(
+           ['class Posn(x, y):
+               extends Object
+               method mdist(arg): this.x + this.y
+               method addDist(arg): arg.mdist(0) + this.mdist(0)',
+            'class Posn3D(z):
+               extends Posn
+               method mdist(arg): this.z + super.mdist(arg)'],
+           '(new Posn(5, null)).mdist(1)'
+         )
+         ~raises "not a number"
+  check: interp_prog(
+           ['class Posn(x, y):
+               extends Object
+               method mdist(arg): this.x + this.y
+               method addDist(arg): arg.mdist(0) + this.mdist(0)',
+            'class Posn3D(z):
+               extends Posn
+               method mdist(arg): this.z + super.mdist(arg)'],
+           'null.m(0)'
+         )
+         ~raises "not an object"
+  check: interp_prog(
+           ['class Posn(x, y):
+               extends Object
+               method mdist(arg): this.x + this.y
+               method addDist(arg): arg.mdist(0) + this.mdist(0)',
+            'class Posn3D(z):
+               extends Posn
+               method mdist(arg): this.z + super.mdist(arg)'],
+           'null.x'
+         )
+         ~raises "not an object"
+  check: interp_prog(
+           ['class Posn(x, y):
+               extends Object
+               method mdist(arg): this.x + this.y
+               method addDist(arg): arg.mdist(0) + this.mdist(0)',
+            'class Posn3D(z):
+               extends Posn
+               method mdist(arg): this.z + super.mdist(arg)'],
+           'new null(1)'
+         )
+         ~raises "null"
+  check: interp_prog(
+           ['class Posn(x, y):
+               extends Object
+               method mdist(arg): null
+               method addDist(arg): arg.mdist(0) + this.mdist(0)',
+            'class Posn3D(z):
+               extends Posn
+               method mdist(arg): this.z + super.mdist(arg)'],
+           '(new Posn(5, 1)).mdist(1)'
+         )
+         ~is 'null'
+  check: interp_prog(
+           ['class Posn(x, y):
+               extends Object
+               method addDist(arg): arg.mdist(0) + this.mdist(0)',
+            'class Posn3D(z):
+               extends Posn
+               method mdist(arg): this.z + super.mdist(arg)'],
+           '(new Posn(null, 1)).x'
+         )
+         ~is 'null'
+  // old tests
+  check: interp_prog(
+           ['class Empty():
+               extends Object'],
+           'new Empty()'
+         )
+         ~is 'Empty'
+
+  check: interp_prog(
+           ['class Posn(x, y):
+               extends Object
+               method mdist(arg): this.x + this.y
+               method addDist(arg): arg.mdist(0) + this.mdist(0)',
+            'class Posn3D(z):
+               extends Posn
+               method mdist(arg): this.z + super.mdist(arg)'],
+           '(new Posn3D(5, 3, 1)).addDist(new Posn(2, 7))'
+         )
+         ~is '18'

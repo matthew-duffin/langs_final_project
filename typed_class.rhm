@@ -1,0 +1,667 @@
+#lang shplait
+import:
+  open:
+    "class.rhm"
+    "inherit.rhm"
+    
+
+type ClassT
+| classT(super_name :: Symbol,
+         fields :: Listof(Symbol * Type),
+         methods :: Listof(Symbol * MethodT))
+
+type MethodT
+| methodT(method_type :: Type, arg_type :: Type,
+          result_type :: Type,
+          body_exp :: ExpI)
+
+type Type
+| intT()
+| objT(class_name :: Symbol)
+| privateT()
+| publicT()
+| nullT()
+  
+
+// ----------------------------------------
+
+fun type_error(a, msg):
+  error(#'typecheck, "no type: " +& a +& " not " +& msg)
+
+fun get_all_field_types(class_name, t_classes):
+  if class_name == #'Object
+  | []
+  | match find(t_classes, class_name)
+    | classT(super_name, fields, methods):
+        append(get_all_field_types(super_name, t_classes),
+               map(snd, fields))
+
+// ----------------------------------------
+
+fun make_find_in_tree(class_items):
+  fun (name, class_name, t_classes):
+    def t_class = find(t_classes, class_name)
+    def items  = class_items(t_class)
+    def super_name = classT.super_name(t_class)
+    if super_name == #'Object
+    | find(items, name)
+    | try:
+        find(items, name)
+        ~catch:
+          make_find_in_tree(class_items)(name,
+                                         super_name,
+                                         t_classes)
+
+def find_field_in_tree = make_find_in_tree(classT.fields)
+
+def find_method_in_tree = make_find_in_tree(classT.methods)
+
+// ----------------------------------------
+
+fun is_subclass(name1, name2, t_classes):
+  cond
+  | name1 == name2: #true
+  | name1 == #'Object: #false
+  | ~else:
+      match find(t_classes, name1)
+      | classT(super_name, fields, methods):
+          is_subclass(super_name, name2, t_classes)
+
+fun is_subtype(t1, t2, t_classes):
+  match t1
+  | objT(name1):
+      match t2 
+      | objT(name2):
+          is_subclass(name1, name2, t_classes)
+      | ~else: #false
+  | nullT():
+      match t2
+      | objT(name2):
+          #true // I think we always want null to be a subtype of objects
+      | nullT(): #true
+      | ~else: #false
+  | ~else: t1 == t2
+
+module test:
+  def a_t_class = values(#'A, classT(#'Object, [], []))
+  def b_t_class = values(#'B, classT(#'A, [], []))
+  
+  check: is_subtype(nullT(), objT(#'B), [b_t_class])
+         ~is #true
+  check: is_subtype(nullT(), nullT(), [b_t_class])
+         ~is #true
+  check: is_subtype(nullT(), intT(), [b_t_class])
+         ~is #false
+  check: is_subclass(#'Object, #'Object, [])
+         ~is #true
+  check: is_subclass(#'A, #'B, [a_t_class, b_t_class])
+         ~is #false
+  check: is_subclass(#'B, #'A, [a_t_class, b_t_class])
+         ~is #true
+  check: is_subtype(intT(), intT(), [])
+         ~is #true
+  check: is_subtype(intT(), objT(#'Object), [])
+         ~is #false
+  check: is_subtype(objT(#'Object), intT(), [])
+         ~is #false
+  check: is_subtype(objT(#'A), objT(#'B), [a_t_class, b_t_class])
+         ~is #false
+  check: is_subtype(objT(#'B), objT(#'A), [a_t_class, b_t_class])
+         ~is #true
+
+// ----------------------------------------
+
+def typecheck_exp :: (ExpI, Listof(Symbol * ClassT), Type, Type) -> Type:
+  fun (exp, t_classes, this_type, arg_type):
+    fun recur(exp):
+      typecheck_exp(exp, t_classes, this_type, arg_type)
+    fun typecheck_nums(l, r):
+      match recur(l)
+      | intT():
+          match recur(r)
+          | intT(): intT()
+          | ~else: type_error(r, "Int")
+      | ~else: type_error(l, "Int")
+    match exp
+    | intI(n): intT()
+    | plusI(l, r): typecheck_nums(l, r)
+    | multI(l, r): typecheck_nums(l, r)
+    | argI(): arg_type
+    | thisI(): this_type
+    | newI(class_name, exps):
+        def arg_types = map(recur, exps)
+        def field_types = get_all_field_types(class_name, t_classes)
+        if (length(arg_types) == length(field_types)
+              && foldl(fun (b, r): b && r,
+                       #true,
+                       map2(fun (t1, t2):
+                              is_subtype(t1, t2, t_classes),
+                            arg_types,
+                            field_types)))
+        | objT(class_name)
+        | type_error(exp, "field type mismatch")
+    | getI(obj_exp, field_name):
+        match recur(obj_exp):
+        | objT(class_name):
+            find_field_in_tree(field_name,
+                               class_name,
+                               t_classes)
+        | ~else: type_error(obj_exp, "object") 
+    | sendI(context, obj_exp, method_name, arg_exp):
+        def obj_type = recur(obj_exp)
+        def arg_type = recur(arg_exp)
+        def context_type = recur(context)
+        match obj_type
+        | objT(class_name):
+            typecheck_send(class_name,
+                           method_name,
+                           context_type,
+                           arg_exp,
+                           arg_type,
+                           t_classes)
+        | ~else:
+           type_error(obj_exp, "object")
+    | superI(context, method_name, arg_exp):
+        def arg_type = recur(arg_exp)
+        def context_type = recur(context)
+        def this_class = find(t_classes, objT.class_name(this_type))
+        typecheck_send(classT.super_name(this_class),
+                       method_name,
+                       context_type,
+                       arg_exp,
+                       arg_type,
+                       t_classes)
+    | nullI(): nullT()
+    | publicI(): publicT()
+    | privateI(): privateT()
+    | if0I(condition, true, false):
+        def condition_t = recur(condition)
+        match condition_t
+        | intT():
+            def true_t = recur(true)
+            def false_t = recur(false)
+            match true_t
+            | intT():
+                match false_t
+                | intT(): intT()
+                | ~else: type_error(false, "intT")
+            | objT(name):
+                match false_t
+                |objT(name2):
+                   cond
+                   | is_any_subclass(name, name2, t_classes) : true_t
+                | ~else:
+                    type_error(false, "objT")
+            | nullT():
+                match false_t
+                | nullT():
+                    nullT()
+                | ~else: type_error(false, "nullT")
+            | ~else:
+                type_error(true, "objT") 
+        | ~else: type_error(condition, "intT") 
+
+module test:
+  check: typecheck(
+     sendI(publicI(), newI(#'Dog, [intI(5), intI(1)]), #'a, intI(0)),
+     [
+       values(
+         #'Animal,
+         classT(
+           #'Object,
+           [values(#'x, intT())],
+           [
+             values(
+               #'mdist,
+               methodT(publicT(), intT(), intT(), getI(thisI(), #'x))
+             )
+           ]
+         )
+       ),
+       values(
+         #'Dog,
+         classT(
+           #'Animal,
+           [values(#'y, intT())],
+           [
+             values(
+               #'a,
+               methodT(
+                 publicT(),
+                 intT(),
+                 objT(#'Animal),
+                 if0I(argI(), newI(#'Dog, [intI(2), intI(1)]), intI(2))
+               )
+             )
+           ]
+         )
+       )
+     ]
+   )
+         ~raises "no type"
+  check: typecheck_exp(if0I(intI(1), intI(1), intI(1)), [], intT(), intT())
+         ~is intT()
+  check: typecheck_exp(if0I(intI(1), nullI(), nullI()), [], intT(), intT())
+         ~is nullT()
+  check: typecheck_exp(if0I(intI(1), intI(1), privateI()), [], intT(), intT())
+         ~raises "no type"
+  check: typecheck_exp(if0I(intI(1), nullI(), privateI()), [], intT(), intT())
+         ~raises "no type"
+  check: typecheck_exp(if0I(intI(1), privateI(), privateI()), [], intT(), intT())
+         ~raises "no type"
+  check: typecheck_exp(if0I(privateI(), privateI(), privateI()), [], intT(), intT())
+         ~raises "no type"
+fun is_any_subclass(name1, name2, t_classes): 
+  cond
+  | is_subclass(name1, name2, t_classes): #true
+  | name1 == #'Object:
+      match find(t_classes, name2)
+      | classT(super_name, fields, methods):
+          is_any_subclass(name1, super_name, t_classes)
+  | ~else:
+      match find(t_classes, name1)
+      | classT(super_name, fields, methods):
+          match find(t_classes, name2)
+          | classT(super_name2, fields2, methods2):
+              is_any_subclass(super_name, super_name2, t_classes)
+module test:
+  check: typecheck(
+     sendI(publicI(), newI(#'Car, [intI(5)]), #'a, intI(1)),
+     [
+       values(
+         #'Animal,
+         classT(
+           #'Object,
+           [values(#'x, intT())],
+           [
+             values(
+               #'mdist,
+               methodT(publicT(), intT(), intT(), getI(thisI(), #'x))
+             )
+           ]
+         )
+       ),
+       values(
+         #'Car,
+         classT(
+           #'Object,
+           [values(#'y, intT())],
+           [
+             values(
+               #'a,
+               methodT(
+                 publicT(),
+                 intT(),
+                 objT(#'Object),
+                 if0I(argI(), newI(#'Car, [intI(1)]), newI(#'Animal, [intI(1)]))
+               )
+             )
+           ]
+         )
+       )
+     ]
+   )
+         ~is objT(#'Object)
+  check: is_any_subclass(#'Object, #'Object, [])
+         ~is #true
+  check: is_any_subclass(#'Object, #'Posn, [ values(
+                                               #'Posn,
+                                               classT(
+                                                 #'Object,
+                                                 [values(#'x, intT()), values(#'y, nullT())],
+                                                 []
+                                               )
+                                             )])
+         ~is #true
+  check: is_any_subclass(#'Posn4D, #'Posn, [ values(
+                                               #'Posn,
+                                               classT(
+                                                 #'Object,
+                                                 [values(#'x, intT()), values(#'y, nullT())],
+                                                 []
+                                               )
+                                             ), values(
+                                               #'Posn3D,
+                                               classT(
+                                                 #'Posn,
+                                                 [values(#'z, intT()), values(#'v, nullT())],
+                                                 []
+                                               )
+                                             ),  values(
+                                               #'Posn4D,
+                                               classT(
+                                                 #'Posn3D,
+                                                 [values(#'f, intT()), values(#'e, nullT())],
+                                                 []
+                                               )
+                                             )])
+         ~is #true
+
+fun typecheck_send(class_name :: Symbol,
+                   method_name :: Symbol,
+                   context_type :: Type, 
+                   arg_exp :: ExpI,
+                   arg_type :: Type,
+                   t_classes :: Listof(Symbol * ClassT)):
+  match find_method_in_tree(method_name,
+                            class_name,
+                            t_classes)
+  | methodT(method_type_m, arg_type_m, result_type, body_exp):
+      if context_type == publicT() && method_type_m == privateT()
+      | type_error(arg_exp, to_string(method_type_m))
+      | if is_subtype(arg_type, arg_type_m, t_classes)
+        | result_type
+        | type_error(arg_exp, to_string(arg_type_m))
+
+fun typecheck_method(method :: MethodT,
+                     this_type :: Type,
+                     t_classes :: Listof(Symbol * ClassT)) :: Void:
+  match method
+  | methodT(method_type, arg_type, result_type, body_exp): 
+      if is_subtype(typecheck_exp(body_exp, t_classes,
+                                  this_type, arg_type),
+                    result_type,
+                    t_classes)
+      | #void
+      | type_error(body_exp, to_string(result_type))
+
+fun check_override(method_name :: Symbol,
+                   method :: MethodT,
+                   this_class :: ClassT,
+                   t_classes :: Listof(Symbol * ClassT)):
+  def super_name = classT.super_name(this_class)
+  def super_method: 
+    try:
+      // Look for method in superclass:
+      find_method_in_tree(method_name,
+                          super_name,
+                          t_classes)
+      ~catch:
+        // no such method in superclass:
+        method
+  if (is_any_subtype(methodT.arg_type(super_method), methodT.arg_type(method), t_classes)
+        && methodT.method_type(method) == methodT.method_type(super_method)
+        && is_any_subtype(methodT.result_type(method), methodT.result_type(super_method), t_classes)) 
+  | #void
+  | error(#'typecheck, "bad override of " +& method_name) 
+
+fun is_any_subtype(t1, t2, t_classes):
+  match t1
+  | objT(name):
+      match t2
+      | objT(name2):
+         if is_subtype(t1, t2, t_classes)
+         | #true
+         | match find(t_classes, name2)
+           | classT(super_name, fields, methods):
+               is_any_subtype(objT(name), objT(super_name), t_classes)
+      | ~else: #false
+  | intT():
+      match t2
+      | intT(): #true
+      | ~else: #false 
+  | nullT():
+      match t2
+      | nullT(): #true
+      | ~else: #false
+  | ~else:  #false
+
+
+fun typecheck_class(class_name :: Symbol,
+                    t_class :: ClassT,
+                    t_classes :: Listof(Symbol * ClassT)):
+  match t_class
+  | classT(super_name, fields, methods):
+      map(fun (m):
+            typecheck_method(snd(m), objT(class_name), t_classes)
+            check_override(fst(m), snd(m), t_class, t_classes),
+          methods)
+
+fun typecheck(a :: ExpI,
+              t_classes :: Listof(Symbol * ClassT)) :: Type:
+  begin:
+    map(fun (tc):
+          typecheck_class(fst(tc), snd(tc), t_classes),
+        t_classes)
+    typecheck_exp(a, t_classes, objT(#'Object), intT())
+
+// ----------------------------------------
+
+module test:
+  check: typecheck(
+     sendI(publicI(), newI(#'Posn, [intI(5), intI(1)]), #'mdist, intI(1)),
+     [
+       values(
+         #'Posn,
+         classT(
+           #'Object,
+           [values(#'x, intT()), values(#'y, intT())],
+           [
+             values(
+               #'mdist,
+               methodT(
+                 privateT(),
+                 intT(),
+                 intT(),
+                 plusI(getI(thisI(), #'x), getI(thisI(), #'y))
+               )
+             )
+           ]
+         )
+       )
+     ]
+   )
+         ~raises "no type"
+  check: is_any_subtype(nullT(), nullT(), [])
+         ~is #true
+  check: is_any_subtype(nullT(), intT(), [])
+         ~is #false
+  check: is_any_subtype(intT(), intT(), [])
+         ~is #true
+  check: is_any_subtype(intT(), nullT(), [])
+         ~is #false
+  check: is_any_subtype(objT(#'Object), nullT(), [])
+         ~is #false
+  check: is_any_subtype(privateT(), nullT(), [])
+         ~is #false
+  def posn_t_class:
+    values(#'Posn,
+           classT(#'Object,
+                  [values(#'x, intT()), values(#'y, intT())],
+                  [values(#'mdist,
+                          methodT(publicT(), intT(), intT(),
+                                  plusI(getI(thisI(), #'x), getI(thisI(), #'y)))),
+                   values(#'addDist,
+                          methodT(publicT(), objT(#'Posn), intT(),
+                                  plusI(sendI(publicI(), thisI(), #'mdist, intI(0)),
+                                        sendI(publicI(), argI(), #'mdist, intI(0)))))]))
+
+  def posn3D_t_class:
+    values(#'Posn3D,
+           classT(#'Posn,
+                  [values(#'z, intT())],
+                  [values(#'mdist,
+                          methodT(publicT(), intT(), intT(),
+                                  plusI(getI(thisI(), #'z),
+                                        superI(publicI(), #'mdist, argI()))))]))
+
+  def square_t_class :
+    values(#'Square,
+           classT(#'Object,
+                  [values(#'topleft, objT(#'Posn))],
+                  []))
+
+  fun typecheck_posn(a):
+    typecheck(a, [posn_t_class, posn3D_t_class, square_t_class])
+  
+  def new_posn27 = newI(#'Posn, [intI(2), intI(7)])
+  def new_posn531 = newI(#'Posn3D, [intI(5), intI(3), intI(1)])
+
+  check: typecheck_posn(sendI(publicI(), new_posn27, #'mdist, intI(0)))
+         ~is intT()
+  check: typecheck_posn(sendI(publicI(), new_posn531, #'mdist, intI(0)))
+         ~is intT()  
+  check: typecheck_posn(sendI(publicI(), new_posn531, #'addDist, new_posn27))
+         ~is intT() 
+  check: typecheck_posn(sendI(publicI(), new_posn27, #'addDist, new_posn531))
+         ~is intT()
+
+  check: typecheck_posn(newI(#'Square, [newI(#'Posn, [intI(0), intI(1)])]))
+         ~is objT(#'Square)
+  check: typecheck_posn(newI(#'Square, [newI(#'Posn3D, [intI(0), intI(1), intI(3)])]))
+         ~is objT(#'Square)
+
+  check: typecheck(multI(intI(1), intI(2)),
+                   [])
+         ~is intT()
+  check: typecheck(nullI(), [])
+         ~is nullT()
+  check: typecheck_exp(privateI(), [], privateT(), privateT())
+         ~is privateT()
+  check: typecheck_posn(sendI(publicI(), intI(10), #'mdist, intI(0)))
+         ~raises "no type"
+  check: typecheck_posn(sendI(publicI(), new_posn27, #'mdist, new_posn27))
+         ~raises "no type"
+  check: typecheck(plusI(intI(1), newI(#'Object, [])),
+                   [])
+         ~raises "no type"
+  check: typecheck(plusI(newI(#'Object, []), intI(1)),
+                   [])
+         ~raises "no type"
+  check: typecheck(plusI(intI(1), newI(#'Object, [intI(1)])),
+                   [])
+         ~raises "no type"
+  check: typecheck(getI(intI(1), #'x),
+                   [])
+         ~raises "no type"
+  check: typecheck(intI(10),
+                   [posn_t_class,
+                    values(#'Other,
+                           classT(#'Posn,
+                                  [],
+                                  [values(#'mdist,
+                                          methodT(publicT(), objT(#'Object), intT(),
+                                                  intI(10)))]))])
+         ~raises "bad override"
+  check: typecheck_method(methodT(publicT(), intT(), objT(#'Object), intI(0)), objT(#'Object), [])
+         ~raises "no type"
+  check: typecheck(intI(0),
+                   [square_t_class,
+                    values(#'Cube,
+                           classT(#'Square,
+                                  [],
+                                  [values(#'m,
+                                          methodT(publicT(), intT(), intT(),
+                                                  // No such method in superclass:
+                                                  superI(publicI(), #'m, intI(0))))]))])
+         ~raises "not found"
+
+// ----------------------------------------
+
+def strip_types :: ClassT -> ClassI:
+  fun (t_class):
+    match t_class
+    | classT(super_name, fields, methods):
+       classI(super_name,
+              map(fst, fields),
+              map(fun (m):
+                    values(fst(m),
+                           match snd(m)
+                           | methodT(method_type, arg_type, result_type, body_exp):
+                               body_exp),
+                  methods))
+
+def interp_t :: (ExpI, Listof(Symbol * ClassT)) -> Value:
+  fun (a, t_classes):
+    interp_i(a,
+             map(fun (c): 
+                   values(fst(c), strip_types(snd(c))),
+                 t_classes))
+
+module test:
+  fun interp_t_posn(a):
+    interp_t(a, [posn_t_class, posn3D_t_class])
+  
+  check: interp_t_posn(sendI(publicI(), new_posn27, #'mdist, intI(0)))
+         ~is intV(9)
+  check: interp_t_posn(sendI(publicI(), new_posn531, #'mdist, intI(0)))
+         ~is intV(9)
+  check: interp_t_posn(sendI(publicI(), new_posn531, #'addDist, new_posn27))
+         ~is intV(18)
+  check: interp_t_posn(sendI(publicI(), new_posn27, #'addDist, new_posn531))
+         ~is intV(18)
+  check: typecheck(
+     sendI(
+       publicI(),
+       newI(#'Beagle, [intI(5), intI(1), nullI()]),
+       #'get_dog,
+       intI(1)
+     ),
+     [
+       values(
+         #'Animal,
+         classT(
+           #'Object,
+           [values(#'x, intT())],
+           [
+             values(
+               #'get_animal,
+               methodT(
+                 publicT(),
+                 intT(),
+                 objT(#'Animal),
+                 newI(#'Animal, [argI()])
+               )
+             )
+           ]
+         )
+       ),
+       values(
+         #'Dog,
+         classT(
+           #'Animal,
+           [values(#'y, intT())],
+           [
+             values(
+               #'get_animal,
+               methodT(
+                 publicT(),
+                 intT(),
+                 objT(#'Animal),
+                 newI(#'Dog, [argI(), argI()])
+               )
+             ),
+             values(
+               #'get_dog,
+               methodT(
+                 publicT(),
+                 intT(),
+                 objT(#'Dog),
+                 newI(#'Dog, [argI(), argI()])
+               )
+             )
+           ]
+         )
+       ),
+       values(
+         #'Beagle,
+         classT(
+           #'Dog,
+           [values(#'null, nullT())],
+           [
+             values(
+               #'get_dog,
+               methodT(
+                 publicT(),
+                 intT(),
+                 objT(#'Animal),
+                 newI(#'Beagle, [argI(), argI(), nullI()])
+               )
+             )
+           ]
+         )
+       )
+     ]
+   )
+         ~is objT(#'Animal)
+  

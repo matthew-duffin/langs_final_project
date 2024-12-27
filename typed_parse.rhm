@@ -1,0 +1,1090 @@
+#lang shplait
+import:
+  open:
+    "class.rhm"
+    "inherit.rhm"
+    "typed_class.rhm"
+    "inherit_parse.rhm"
+
+// ----------------------------------------
+
+fun parse_t_class(s :: Syntax) :: (Symbol * ClassT):
+  match s
+  | 'class $name($field, ...):
+       extends $parent_name
+       $method
+       ...':
+      values(syntax_to_symbol(name),
+             classT(syntax_to_symbol(parent_name),
+                    map(parse_t_field,
+                        syntax_to_list('[$field, ...]')),
+                    map(parse_t_method,
+                        syntax_to_list('[$method, ...]'))))
+  | ~else: error(#'parse_class, "invalid input: " +& s)
+
+fun parse_t_field(s :: Syntax) :: (Symbol * Type):
+  match s
+  | '$name :: $ty':
+      values(syntax_to_symbol(name),
+             parse_type(ty))
+  | ~else: error(#'parse_t_field, "invalid input: " +& s)
+
+fun parse_t_method(s :: Syntax) :: (Symbol * MethodT):
+  match s
+  |'method :: $method_ty $name(arg :: $arg_ty) :: $res_ty: $body':
+     values(syntax_to_symbol(name),
+            methodT(parse_type(method_ty),
+                    parse_type(arg_ty),
+                    parse_type(res_ty),
+                    parse(body)))
+  |'method :: $method_ty $name(null :: $null_ty) :: $res_ty: $body':
+     values(syntax_to_symbol(name),
+            methodT(parse_type(method_ty),
+                    parse_type(null_ty),
+                    parse_type(res_ty),
+                    parse(body)))   
+  | ~else: error(#'parse_t_method, "invalid input: " +& s)
+
+fun parse_type(s :: Syntax) :: Type:
+  match s
+  | 'Int': intT()
+  | 'null' : nullT()
+  | 'private' : privateT()
+  | 'public' : publicT()
+  | ~else:
+      cond
+      | syntax_is_symbol(s):
+          objT(syntax_to_symbol(s))
+      | ~else: error(#'parse_type, "invalid input: " +& s)
+
+module test:
+  check: parse_type('Int')
+         ~is intT()
+  check: parse_type('null')
+         ~is nullT()
+  check: parse_type('Object')
+         ~is objT(#'Object)
+  check: parse_type('()')
+         ~raises "invalid input"
+
+  check: parse_t_field('x :: Int')
+         ~is values(#'x, intT())
+  check: parse_t_field('x :: null')
+         ~is values(#'x, nullT())
+  check: parse_t_field('x')
+         ~raises "invalid input"
+
+  check: parse_t_method('method :: public m(arg :: Int) :: Object: this')
+         ~is values(#'m, methodT(publicT(), intT(), objT(#'Object), thisI()))
+  check: parse_t_method('method :: public m(arg :: null) :: Object: this')
+         ~is values(#'m, methodT(publicT(), nullT(), objT(#'Object), thisI()))
+  check: parse_t_method('method :: private m(arg :: null) :: null: null')
+         ~is values(#'m, methodT(privateT(), nullT(), nullT(), nullI()))
+  check: parse_t_method('m 1')
+         ~raises "invalid input"
+  
+  check: parse_t_class('class Posn3D(x :: Int,
+                                     y :: Int):
+                          extends Posn
+                          method :: private m1(arg :: Int) :: Int:
+                            arg
+                          method :: public m2(arg :: Int) :: Object:
+                            this')
+         ~is values(#'Posn3D,
+                    classT(#'Posn,
+                           [values(#'x, intT()),
+                            values(#'y, intT())],
+                           [values(#'m1, methodT(privateT(), intT(), intT(), argI())),
+                            values(#'m2, methodT(publicT(), intT(), objT(#'Object), thisI()))]))
+  check: parse_t_class('class')
+         ~raises "invalid input"
+
+// ----------------------------------------
+
+fun run_t_prog(classes :: Listof(Syntax), a :: Syntax) :: Syntax:
+  def a_parsed = parse(a)
+  def classes_parsed = map(parse_t_class, classes)
+  begin:
+    typecheck(a_parsed, classes_parsed)
+    match interp_t(a_parsed, classes_parsed):
+    | intV(n): integer_to_syntax(n)
+    | objV(class_name, field_vals): symbol_to_syntax(class_name)
+    | nullV(): 'null'
+    | ~else: 'not valid value'
+
+module test:
+  // contravariant reject
+  check: run_t_prog(
+           [
+             'class Animal(x :: Int):
+                extends Object
+                method :: public get_animal(arg :: Beagle) :: Animal:
+                  arg',
+             'class Dog(y :: Int):
+                extends Animal
+                method :: public get_animal(arg :: Animal) :: Animal:
+                 arg',
+             'class Beagle(null :: null):
+                extends Dog
+                method :: public get_animal(arg :: Int) :: Animal:
+                  arg'
+           ],
+           '(new Beagle(1, 2, null)).get_animal(new Animal(1))'
+         )
+         ~raises "no type"
+  // contravariant pass
+  check: run_t_prog(
+           [
+             'class Animal(x :: Int):
+                extends Object
+                method :: public interact(arg :: Dog) :: Animal:
+                  new Animal(1)',
+             'class Dog(y :: Int):
+                extends Animal
+                method :: public interact(arg :: Animal) :: Dog:
+                 new Dog(1, 2)'
+           ],
+           '(new Animal(1)).interact(new Dog(1, 2))'
+         )
+         ~is 'Animal'
+  check: run_t_prog(
+           [
+             'class Animal(x :: Int):
+                extends Object
+                method :: public interact(arg :: Dog) :: Animal:
+                  arg',
+             'class Dog(y :: Int):
+                extends Animal
+                method :: public interact(arg :: Animal) :: Dog:
+                 new Dog(1, 2)'
+           ],
+           '(new Dog(1, 2)).interact(new Animal(1))'
+         )
+         ~is 'Dog'
+  check: run_t_prog(
+           [
+             'class Animal(x :: Int):
+                extends Object
+                method :: public get_animal(arg :: Beagle) :: Animal:
+                  arg',
+             'class Dog(y :: Int):
+                extends Animal
+                method :: public get_animal(arg :: Animal) :: Animal:
+                 arg',
+             'class Beagle(null :: null):
+                extends Dog
+                method :: public get_animal(arg :: Animal) :: Animal:
+                  arg'
+           ],
+           '(new Beagle(1, 2, null)).get_animal(new Animal(1))'
+         )
+         ~is 'Animal'
+  check: run_t_prog(
+           [
+             'class Animal(x :: Int):
+                extends Object
+                method :: public get_animal(arg :: Beagle) :: Animal:
+                  arg',
+             'class Dog(y :: Int):
+                extends Animal
+                method :: public get_animal(arg :: Animal) :: Animal:
+                 arg
+                method :: public get_dog(arg :: Int) :: Dog:
+                  new Dog(arg, arg)',
+             'class Beagle(null :: null):
+                extends Dog
+                method :: public get_dog(arg :: Int) :: Beagle:
+                  new Beagle(arg, arg, null)'
+           ],
+           '(new Animal(1)).get_animal(new Beagle(1, 2, null))'
+         )
+         ~is 'Beagle'
+  check: run_t_prog(
+           [
+             'class Animal(x :: Int):
+                extends Object
+                method :: public get_animal(arg :: Dog) :: Animal:
+                  arg',
+             'class Dog(y :: Int):
+                extends Animal
+                method :: public get_animal(arg :: Animal) :: Animal:
+                 arg
+                method :: public get_dog(arg :: Int) :: Dog:
+                  new Dog(arg, arg)',
+             'class Beagle(null :: null):
+                extends Dog
+                method :: public get_dog(arg :: Int) :: Beagle:
+                  new Beagle(arg, arg, null)'
+           ],
+           '(new Animal(1)).get_animal(new Dog(1, 2))'
+         )
+         ~is 'Dog'
+  check: run_t_prog(
+           [
+             'class Animal(x :: Int):
+                extends Object
+                method :: public get_animal(arg :: Dog) :: Animal:
+                  arg',
+             'class Dog(y :: Int):
+                extends Animal
+                method :: public get_animal(arg :: Animal) :: Animal:
+                 arg
+                method :: public get_dog(arg :: Int) :: Dog:
+                  new Dog(arg, arg)',
+             'class Beagle(null :: null):
+                extends Dog
+                method :: public get_dog(arg :: Int) :: Beagle:
+                  new Beagle(arg, arg, null)'
+           ],
+           '(new Dog(5, 1)).get_animal(new Animal(1))'
+         )
+         ~is 'Animal'
+  // covariant reject
+  check: run_t_prog(
+           [
+             'class Animal(x :: Int):
+                extends Object
+                method :: public get_animal(arg :: Int) :: Animal:
+                  new Animal(arg)',
+             'class Dog(y :: Int):
+                extends Animal
+                method :: public get_animal(arg :: Int) :: Dog:
+                 new Dog(arg, arg)
+                method :: public get_dog(arg :: Int) :: Dog:
+                  new Dog(arg, arg)',
+             'class Beagle(null :: null):
+                extends Dog
+                method :: public get_dog(arg :: Int) :: Int:
+                  new Beagle(arg, arg, null)'
+           ],
+           '(new Beagle(5, 1, null)).get_dog(1)'
+         )
+         ~raises "no type"
+  check: run_t_prog(
+           [
+             'class Animal(x :: Int):
+                extends Object
+                method :: public get_animal(arg :: Int) :: Dog:
+                  new Animal(arg)',
+             'class Dog(y :: Int):
+                extends Animal
+                method :: public get_animal(arg :: Int) :: Dog:
+                 new Dog(arg, arg)
+                method :: public get_dog(arg :: Int) :: Dog:
+                  new Dog(arg, arg)',
+             'class Beagle(null :: null):
+                extends Dog
+                method :: public get_dog(arg :: Int) :: Beagle:
+                  new Beagle(arg, arg, null)'
+           ],
+           '(new Animal(5)).get_animal(1)'
+         )
+         ~raises "no type"
+  // covariant pass
+  check: run_t_prog(
+           [
+             'class Animal(x :: Int):
+                extends Object
+                method :: public get_animal(arg :: Int) :: Animal:
+                  new Animal(arg)',
+             'class Dog(y :: Int):
+                extends Animal
+                method :: public get_animal(arg :: Int) :: Animal:
+                 new Dog(arg, arg)
+                method :: public get_dog(arg :: Int) :: Dog:
+                  new Dog(arg, arg)',
+             'class Beagle(null :: null):
+                extends Dog
+                method :: public get_dog(arg :: Int) :: Animal:
+                  new Beagle(arg, arg, null)'
+           ],
+           '(new Beagle(5, 1, null)).get_dog(1)'
+         )
+         ~is 'Beagle'
+  check: run_t_prog(
+           [
+             'class Animal(x :: Int):
+                extends Object
+                method :: public get_animal(arg :: Int) :: Animal:
+                  new Animal(arg)',
+             'class Dog(y :: Int):
+                extends Animal
+                method :: public get_animal(arg :: Int) :: Dog:
+                 new Dog(arg, arg)
+                method :: public get_dog(arg :: Int) :: Dog:
+                  new Dog(arg, arg)',
+             'class Beagle(null :: null):
+                extends Dog
+                method :: public get_dog(arg :: Int) :: Beagle:
+                  new Beagle(arg, arg, null)'
+           ],
+           '(new Beagle(5, 1, null)).get_dog(1)'
+         )
+         ~is 'Beagle'
+  check: run_t_prog(
+           [
+             'class Animal(x :: Int):
+                extends Object
+                method :: public get_animal(arg :: Int) :: Animal:
+                  new Animal(arg)',
+             'class Dog(y :: Int):
+                extends Animal
+                method :: public get_animal(arg :: Int) :: Dog:
+                 new Dog(arg, arg)
+                method :: public get_dog(arg :: Int) :: Dog:
+                  new Dog(arg, arg)',
+             'class Beagle(null :: null):
+                extends Dog
+                method :: public get_dog(arg :: Int) :: Beagle:
+                  new Beagle(arg, arg, null)'
+           ],
+           '(new Dog(5, 1)).get_dog(1)'
+         )
+         ~is 'Dog'
+  check: run_t_prog(
+           [
+             'class Animal(x :: Int):
+                extends Object
+                method :: public get_animal(arg :: Int) :: Animal:
+                  new Animal(arg)',
+             'class Dog(y :: Int):
+                extends Animal
+                method :: public get_animal(arg :: Int) :: Dog:
+                 new Dog(arg, arg)'
+           ],
+           '(new Dog(5, 1)).get_animal(1)'
+         )
+         ~is 'Dog'
+  check: run_t_prog(
+           [
+             'class Animal(x :: Int):
+                extends Object
+                method :: public get_animal(arg :: Int) :: Animal:
+                  new Animal(arg)',
+             'class Dog(y :: Int):
+                extends Animal
+                method :: public get_animal(arg :: Int) :: Dog:
+                 new Dog(arg, arg)'
+           ],
+           '(new Animal(5)).get_animal(1)'
+         )
+         ~is 'Animal'
+  check: run_t_prog(
+           [
+             'class Animal(x :: Int):
+                extends Object
+                method :: public get_animal(arg :: Int) :: Animal:
+                  new Animal(arg)',
+             'class Dog(y :: Int):
+                extends Animal
+                method :: public get_dog(arg :: Int) :: Dog:
+                 new Dog(arg, arg)'
+           ],
+           '(new Dog(5, 1)).get_dog(1)'
+         )
+         ~is 'Dog'
+  // if0I tests
+  check: run_t_prog(
+           [
+             'class Posn(x :: Int,
+                         y :: Int):
+                extends Object
+                method :: public mdist(arg :: Int) :: Int:
+                  if arg == 0 | 1 | 2'
+           ],
+           '(new Posn(5, 1)).mdist(0)'
+         )
+         ~is '1'
+  check: run_t_prog(
+           [
+             'class Posn(x :: Int,
+                         y :: Int):
+                extends Object
+                method :: public mdist(arg :: Int) :: Int:
+                  if arg == 0 | 1 | 2'
+           ],
+           '(new Posn(5, 1)).mdist(1)'
+         )
+         ~is '2'
+  check: run_t_prog(
+           [
+             'class Animal(x :: Int):
+                extends Object
+                method :: public mdist(arg :: Int) :: Int:
+                  this.x',
+             'class Dog(y :: Int):
+                extends Animal
+                method :: public a(arg :: Int) :: Animal:
+                 if 0 == 0 | new Dog(2, 1) | new Animal(2)'
+           ],
+           '(new Dog(5, 1)).a(1)'
+         )
+         ~is 'Dog'
+  check: run_t_prog(
+           [
+             'class Animal(x :: Int):
+                extends Object
+                method :: public mdist(arg :: Int) :: Int:
+                  this.x',
+             'class Dog(y :: Int):
+                extends Animal
+                method :: public a(arg :: Int) :: Animal:
+                 if arg == 0 | new Dog(2, 1) | new Animal(2)'
+           ],
+           '(new Dog(5, 1)).a(1)'
+         )
+         ~is 'Animal'
+  check: run_t_prog(
+           [
+             'class Animal(x :: Int):
+                extends Object
+                method :: public mdist(arg :: Int) :: Int:
+                  this.x',
+             'class Dog(y :: Int):
+                extends Animal
+                method :: public a(arg :: Int) :: Animal:
+                 if arg == 0 | new Dog(2, 1) | new Animal(2)'
+           ],
+           '(new Dog(5, 1)).a(0)'
+         )
+         ~is 'Dog'
+  check: run_t_prog(
+           [
+             'class Animal(x :: Int):
+                extends Object
+                method :: public mdist(arg :: Int) :: Int:
+                  this.x',
+             'class Dog(y :: Int):
+                extends Animal
+                method :: public a(arg :: Int) :: Animal:
+                 if arg == 0 | new Dog(2, 1) | 2'
+           ],
+           '(new Dog(5, 1)).a(0)'
+         )
+         ~raises "no type"
+  check: run_t_prog(
+           [
+             'class Animal(x :: Int):
+                extends Object
+                method :: public mdist(arg :: Int) :: Int:
+                  this.x',
+             'class Dog(y :: Int):
+                extends Animal
+                method :: public a(arg :: Int) :: null:
+                 if arg == 0 | null | null'
+           ],
+           '(new Dog(5, 1)).a(0)'
+         )
+         ~is 'null'
+  check: run_t_prog(
+           [
+             'class Animal(x :: Int):
+                extends Object
+                method :: public mdist(arg :: Int) :: Int:
+                  this.x',
+             'class Dog(y :: Int):
+                extends Animal
+                method :: public a(arg :: Int) :: null:
+                 if arg == 0 | null | null'
+           ],
+           '(new Dog(5, 1)).a(1)'
+         )
+         ~is 'null'
+  check: run_t_prog(
+           [
+             'class Animal(x :: Int):
+                extends Object
+                method :: public mdist(arg :: Int) :: Int:
+                  this.x',
+             'class Dog(y :: Int):
+                extends Animal
+                method :: public a(arg :: Int) :: null:
+                 if arg == 0 | null | null'
+           ],
+           '(new Dog(5, 1)).a(1)'
+         )
+         ~is 'null'
+  check: run_t_prog(
+           [
+             'class Animal(x :: Int):
+                extends Object
+                method :: public mdist(arg :: Int) :: Int:
+                  this.x',
+             'class Car(y :: Int):
+                extends Object
+                method :: public a(arg :: Int) :: Object:
+                 if arg == 0 | new Car(1) | new Animal(1)'
+           ],
+           '(new Car(5)).a(1)'
+         )
+         ~is 'Animal'
+  check: run_t_prog(
+           [
+             'class Animal(x :: Int):
+                extends Object
+                method :: public mdist(arg :: Int) :: Int:
+                  this.x',
+             'class Car(y :: Int):
+                extends Object
+                method :: public a(arg :: Int) :: Object:
+                 if arg == 0 | new Car(1) | new Animal(1)'
+           ],
+           '(new Car(5)).a(0)'
+         )
+         ~is 'Car'
+  check: run_t_prog(
+           [
+             'class Animal(x :: Int):
+                extends Object
+                method :: public mdist(arg :: Int) :: Int:
+                  this.x',
+             'class Dog(z :: Int):
+                extends Animal
+                method :: public b(arg :: Int) :: Int:
+                  this.z',
+             'class Car(y :: Int):
+                extends Object
+                method :: public a(arg :: Int) :: Animal:
+                 if arg == 0 | new Car(1) | new Dog(2, 1)'
+           ],
+           '(new Car(5)).a(0)'
+         )
+         ~raises "no type"
+  check: run_t_prog(
+           [
+             'class Animal(x :: Int):
+                extends Object
+                method :: public mdist(arg :: Int) :: Int:
+                  this.x',
+             'class Dog(z :: Int):
+                extends Animal
+                method :: public b(arg :: Int) :: Int:
+                  this.z',
+             'class Car(y :: Int):
+                extends Object
+                method :: public a(arg :: Int) :: Object:
+                 if arg == 0 | new Car(1) | new Dog(0, 1)'
+           ],
+           '(new Car(5)).a(0)'
+         )
+         ~is 'Car'
+  check: run_t_prog(
+           [
+             'class king_animal(king :: Int):
+                extends Object
+                method :: public king(arg :: Int) :: null:
+                  null',
+             'class Animal(x :: Int):
+                extends king_animal
+                method :: public mdist(arg :: Int) :: Int:
+                  this.x',
+             'class Dog(z :: Int):
+                extends Animal
+                method :: public b(arg :: Int) :: Int:
+                  this.z',
+             'class Lizard(y :: Int):
+                extends Animal
+                method :: public a(arg :: Int) :: Animal:
+                 if arg == 0 | new Lizard(1, 0, 1) | new Dog(1, 0, 1)'
+           ],
+           '(new Lizard(1, 1, 2)).a(0)'
+         )
+         ~is 'Lizard'
+  check: run_t_prog(
+           [
+             'class king_animal(king :: Int):
+                extends Object
+                method :: public king(arg :: Int) :: null:
+                  null',
+             'class Animal(x :: Int):
+                extends king_animal
+                method :: public mdist(arg :: Int) :: Int:
+                  this.x',
+             'class Dog(z :: Int):
+                extends Animal
+                method :: public b(arg :: Int) :: Int:
+                  this.z',
+             'class Lizard(y :: Int):
+                extends Animal
+                method :: public a(arg :: Int) :: Animal:
+                 if arg == 0 | new Lizard(1, 0, 1) | new Dog(1, 0, 1)'
+           ],
+           'if 0 == 0 | new Lizard(1, 0, 1) | new Dog(1, 0, 1)'
+         )
+         ~is 'Lizard'
+  check: run_t_prog(
+           [
+             'class king_animal(king :: Int):
+                extends Object
+                method :: public king(arg :: Int) :: null:
+                  null',
+             'class Animal(x :: Int):
+                extends king_animal
+                method :: public mdist(arg :: Int) :: Int:
+                  this.x',
+             'class Dog(z :: Int):
+                extends Animal
+                method :: public b(arg :: Int) :: Int:
+                  this.z',
+             'class Lizard(y :: Int):
+                extends Animal
+                method :: public a(arg :: Int) :: Animal:
+                 if arg == 0 | new Lizard(1, 0, 1) | new Dog(1, 0, 1)'
+           ],
+           'if 1 == 0 | new Lizard(1, 0, 1) | new Dog(1, 0, 1)'
+         )
+         ~is 'Dog'
+  check: run_t_prog(
+           [
+             'class king_animal(king :: Int):
+                extends Object
+                method :: public king(arg :: Int) :: null:
+                  null',
+             'class Animal(x :: Int):
+                extends king_animal
+                method :: public mdist(arg :: Int) :: Int:
+                  this.x',
+             'class Dog(z :: Int):
+                extends Animal
+                method :: public b(arg :: Int) :: Int:
+                  this.z',
+             'class Lizard(y :: Int):
+                extends Animal
+                method :: public a(arg :: Int) :: king_animal:
+                 if arg == 0 | new Lizard(1, 0, 1) | new Dog(1, 0, 1)'
+           ],
+           '(new Lizard(1, 1, 2)).a(1)'
+         )
+         ~is 'Dog'
+  // private tests
+  check: run_t_prog(
+           [
+             'class Posn(x :: Int,
+                         y :: Int):
+                extends Object
+                method :: public mdist(arg :: Int) :: Int:
+                  this.x + this.y
+                method :: public addDist(arg :: Posn) :: Int:
+                  arg.mdist(1)'
+           ],
+           '(new Posn(5, 1)).addDist(null)'
+         )
+         ~raises "not an object"
+  check: run_t_prog(
+           [
+             'class Posn(x :: Int,
+                         y :: Int):
+                extends Object
+                method :: public mdist(arg :: Int) :: Int:
+                  this.x + this.y
+                method :: public addDist(arg :: Posn) :: Int:
+                  arg.x'
+           ],
+           '(new Posn(5, 1)).addDist(null)'
+         )
+         ~raises "not an object"
+  check: run_t_prog(
+           [
+             'class Posn(x :: Int,
+                         y :: Int):
+                extends Object
+                method :: private mdist(arg :: null) :: null:
+                  null',
+             'class Posn3D(z :: Int):
+                extends Posn
+                method :: public access(arg :: null) :: null:
+                  this.mdist(arg)
+                method :: private mdist(arg :: null) :: null:
+                  null'
+           ],
+           '(new Posn3D(5, 1, 2)).access(null)'
+         )
+         ~is 'null'
+  check: run_t_prog(
+           [
+             'class Posn(x :: Int,
+                         y :: Int):
+                extends Object
+                method :: private mdist(arg :: null) :: Int:
+                  this.x + this.y',
+             'class Posn3D(z :: Int):
+                extends Posn
+                method :: public access(arg :: null) :: Int:
+                  this.mdist(arg)
+                method :: private mdist(arg :: null) :: Int:
+                  0'
+           ],
+           '(new Posn3D(5, 1, 2)).access(null)'
+         )
+         ~is '0'
+  check: run_t_prog(
+           [
+             'class Posn(x :: Int,
+                         y :: Int):
+                extends Object
+                method :: public addDist(arg :: Posn) :: Int:
+                  this.mdist(0) + this.mdist(0)
+                method :: private mdist(arg :: Int) :: Int:
+                  this.x + this.y'
+           ],
+           '(new Posn(5, 1)).addDist(new Posn(5, 1))'
+         )
+         ~is '12'
+  check: run_t_prog(
+           [
+             'class Posn(x :: Int,
+                         y :: Int):
+                extends Object
+                method :: private mdist(arg :: Int) :: Int:
+                  this.x + this.y
+                method :: public addDist(arg :: Posn) :: Int:
+                  this.mdist(0) + this.mdist(0)'
+           ],
+           '(new Posn(5, 1)).addDist(new Posn(5, 1))'
+         )
+         ~is '12'
+  check: run_t_prog(
+           [
+             'class Posn(x :: Int,
+                         y :: Int):
+                extends Object
+                method :: private mdist(arg :: Int) :: Int:
+                  this.x + this.y
+                method :: public addDist(arg :: Posn) :: Int:
+                  this.mdist(0) + this.mdist(0)',
+             'class Posn3D(z :: Int):
+                extends Posn
+                method :: public access(arg :: Int) :: Int:
+                  this.mdist(0)
+                method :: private mdist(arg :: Int) :: Int:
+                  arg'
+           ],
+           '(new Posn3D(5, 1, 2)).access(1)'
+         )
+         ~is '0'
+  check: run_t_prog(
+           [
+             'class Posn(x :: Int,
+                         y :: Int):
+                extends Object
+                method :: private mdist(arg :: Int) :: Int:
+                  this.x + this.y
+                method :: public addDist(arg :: Posn) :: Int:
+                  this.mdist(0) + this.mdist(0)',
+             'class Posn3D(z :: Int):
+                extends Posn
+                method :: public access(arg :: Int) :: Int:
+                  this.mdist(1)
+                method :: private mdist(arg :: Int) :: Int:
+                  this.z'
+           ],
+           '(new Posn3D(5, 1, 2)).access(1)'
+         )
+         ~is '2'
+  
+  check: run_t_prog(
+           [
+             'class Posn(x :: Int,
+                         y :: Int):
+                extends Object
+                method :: private mdist(arg :: Int) :: Int:
+                  this.x + this.y
+                method :: public addDist(arg :: Posn) :: Int:
+                  this.mdist(0) + this.mdist(0)',
+             'class Posn3D(z :: Int):
+                extends Posn
+                method :: public mdist(arg :: Int) :: Int:
+                  this.z'
+           ],
+           '(new Posn3D(5, 1, 2)).mdist(1)'
+         )
+         ~raises "bad override"
+  check: run_t_prog(
+           [
+             'class Posn(x :: Int,
+                         y :: Int):
+                extends Object
+                method :: public mdist(arg :: Int) :: Int:
+                  this.x + this.y
+                method :: public addDist(arg :: Posn) :: Int:
+                  arg.mdist(0) + this.mdist(0)',
+             'class Posn3D(z :: Int):
+                extends Posn
+                method :: public mdist(arg :: Int) :: Int:
+                  this.z + super.mdist(arg)'
+           ],
+           '(new Posn3D(5, 1, 2)).mdist(1)'
+         )
+         ~is '8'
+  check: run_t_prog(
+           [
+             'class Posn(x :: Int,
+                         y :: Int):
+                extends Object
+                method :: public mdist(arg :: Int) :: Int:
+                  this.getx(1) + this.y
+                method :: private getx(arg :: Int) :: Int:
+                  this.x
+              '
+           ],
+           '(new Posn(5, 1)).mdist(1)'
+         )
+         ~is '6'
+  check: run_t_prog(
+           [
+             'class Posn(x :: Int,
+                         y :: Int):
+                extends Object
+                method :: private mdist(arg :: Int) :: Int:
+                  this.x + this.y'
+           ],
+           '(new Posn(5, 1)).mdist(1)'
+         )
+         ~raises "no type"
+  // null tests
+  check: run_t_prog(
+           [
+             'class Posn(x :: Int,
+                         y :: Int):
+                extends Object
+                method :: public mdist(arg :: Int) :: Int:
+                  this.x + this.y
+                method :: public addDist(arg :: Posn) :: Int:
+                  1'
+           ],
+           '(new Posn(5, 1)).addDist(null)'
+         )
+         ~is '1'       
+  check: run_t_prog(
+           [
+             'class Posn(x :: Int,
+                         y :: null):
+                extends Object
+                method :: public mdist(arg :: Int) :: Int:
+                  this.x + this.y
+                method :: public addDist(arg :: Posn) :: Int:
+                  arg.mdist(0) + this.mdist(0)',
+             'class Posn3D(z :: Int):
+                extends Posn
+                method :: public mdist(arg :: Int) :: Int:
+                  this.z + super.mdist(arg)'
+           ],
+           '(new Posn(5, 1)).mdist(1)'
+         )
+         ~raises "no type"
+  check: run_t_prog(
+           [
+             'class Posn(x :: Int,
+                         y :: null):
+                extends Object
+                method :: public mdist(arg :: Int) :: null:
+                  this.x
+                method :: public addDist(arg :: Posn) :: Int:
+                  arg.mdist(0) + this.mdist(0)',
+             'class Posn3D(z :: Int):
+                extends Posn
+                method :: public mdist(arg :: Int) :: Int:
+                  this.z + super.mdist(arg)'
+           ],
+           '(new Posn(5, null)).mdist(1)'
+         )
+         ~raises "no type"
+  check: run_t_prog(
+           [
+             'class Posn(x :: Int,
+                         y :: null):
+                extends Object
+                method :: public mdist(arg :: Int) :: Int:
+                  this.x + this.y
+                method :: public addDist(arg :: Posn) :: Int:
+                  arg.mdist(0) + this.mdist(0)',
+             'class Posn3D(z :: Int):
+                extends Posn
+                method :: public mdist(arg :: Int) :: Int:
+                  this.z + super.mdist(arg)'
+           ],
+           '(new Posn(5, null)).mdist(1)'
+         )
+         ~raises "no type"
+  
+  check: run_t_prog(
+           [
+             'class Posn(x :: Int,
+                         y :: Int):
+                extends Object
+                method :: public mdist(arg :: Int) :: Int:
+                  this.x + this.y
+                method :: public addDist(arg :: Posn) :: Int:
+                  arg.mdist(0) + this.mdist(0)',
+             'class Posn3D(z :: Int):
+                extends Posn
+                method :: public mdist(arg :: Int) :: Int:
+                  this.z + super.mdist(arg)'
+           ],
+           'null'
+         )
+         ~is 'null' 
+  check: run_t_prog(
+           [
+             'class Posn(x :: Int,
+                         y :: null):
+                extends Object
+                method :: public mdist(arg :: Int) :: Int:
+                  this.x + this.y 
+                method :: public addDist(arg :: Posn) :: Int:
+                  arg.mdist(0) + this.mdist(0)',
+             'class Posn3D(z :: Int):
+                extends Posn
+                method :: public mdist(arg :: Int) :: Int:
+                  this.z + super.mdist(arg)'
+           ],
+           '(new Posn3D(5, null, 1)).addDist(new Posn(2, null))'
+         )
+         ~raises "no type"
+  check: run_t_prog(
+           [
+             'class Posn(x :: Int,
+                         y :: null):
+                extends Object
+                method :: public mdist(arg :: Int) :: Int:
+                  this.x
+                method :: public addDist(arg :: Posn) :: Int:
+                  arg.mdist(0) + this.mdist(0)',
+             'class Posn3D(z :: Int):
+                extends Posn
+                method :: public mdist(arg :: Int) :: Int:
+                  this.z + super.mdist(arg)'
+           ],
+           '(new Posn3D(5, null, 1)).addDist(new Posn(2, null))'
+         )
+         ~is '8'
+  check: run_t_prog(
+           [
+             'class Posn(x :: Int,
+                         y :: null):
+                extends Object
+                method :: public mdist(arg :: Int) :: Int:
+                  this.x
+                method :: public addDist(arg :: Posn) :: Int:
+                  arg.mdist(0) + this.mdist(0)',
+             'class Posn3D(z :: Int):
+                extends Posn
+                method :: public mdist(arg :: Int) :: Int:
+                  this.z + super.mdist(arg)'
+           ],
+           'null.m(0)'
+         )
+         ~raises "no type"
+  check: run_t_prog(
+           [
+             'class Posn(x :: Int,
+                         y :: null):
+                extends Object
+                method :: public mdist(arg :: Int) :: Int:
+                  this.x
+                method :: public addDist(arg :: Posn) :: Int:
+                  arg.mdist(0) + this.mdist(0)',
+             'class Posn3D(z :: Int):
+                extends Posn
+                method :: public mdist(arg :: Int) :: Int:
+                  this.z + super.mdist(arg)'
+           ],
+           'null.x'
+         ) 
+         ~raises "no type"
+  check: run_t_prog(
+           [
+             'class Posn(x :: Int,
+                         y :: null):
+                extends Object
+                method :: public mdist(arg :: Int) :: Int:
+                  this.x
+                method :: public addDist(arg :: Posn) :: Int:
+                  arg.mdist(0) + this.mdist(0)',
+             'class Posn3D(z :: Int):
+                extends Posn
+                method :: public mdist(arg :: Int) :: Int:
+                  this.z + super.mdist(arg)'
+           ],
+           'new null()'
+         )
+         ~raises "null"
+  check: run_t_prog(
+           [
+             'class Posn(x :: Int,
+                         y :: Int):
+                extends Object
+                method :: public mdist(arg :: Int) :: null:
+                  null
+                method :: public addDist(arg :: Posn) :: Int:
+                  this.x'
+           ],
+           '(new Posn(5, 1)).mdist(1)'
+         )
+         ~is 'null'
+  check: run_t_prog(
+           [
+             'class Posn(x :: Int,
+                         y :: Int):
+                extends Object
+                method :: public mdist(arg :: Int) :: null:
+                  null
+                method :: public addDist(arg :: Posn) :: Int:
+                  this.x'
+           ],
+           '(new Posn(5, 1)).mdist(1)'
+         )
+         ~is 'null'
+  check: run_t_prog(
+           [
+             'class Posn(x :: Int,
+                         y :: Int):
+                extends Object
+                method :: public mdist(null :: null) :: null:
+                  null
+                method :: public addDist(arg :: Posn) :: Int:
+                  this.x'
+           ],
+           '(new Posn(5, 1)).mdist(null)'
+         )
+         ~is 'null'
+  check: run_t_prog(
+           [
+             'class Posn(x :: Int,
+                         y :: null):
+                extends Object
+                method :: public mdist(arg :: Int) :: Int:
+                  this.x
+                method :: public addDist(arg :: Posn) :: Int:
+                  arg.mdist(0) + this.mdist(0)',
+             'class Posn3D(z :: Int):
+                extends Posn
+                method :: public mdist(arg :: Int) :: Int:
+                  this.z + super.mdist(arg)'
+           ],
+           '(new Posn(1, null)).y'
+         )
+         ~is 'null'
+  // old tests
+  check: run_t_prog(['class Empty():
+                        extends Object'],
+                    'new Empty()')
+         ~is 'Empty'
+         
+  check: run_t_prog(
+           [
+             'class Posn(x :: Int,
+                         y :: Int):
+                extends Object
+                method :: public mdist(arg :: Int) :: Int:
+                  this.x + this.y
+                method :: public addDist(arg :: Posn) :: Int:
+                  arg.mdist(0) + this.mdist(0)',
+             'class Posn3D(z :: Int):
+                extends Posn
+                method :: public mdist(arg :: Int) :: Int:
+                  this.z + super.mdist(arg)'
+           ],
+           '(new Posn3D(5, 3, 1)).addDist(new Posn(2, 7))'
+         )
+         ~is '18' 
